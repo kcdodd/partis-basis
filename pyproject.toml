@@ -1,0 +1,63 @@
+# -*- coding: UTF-8 -*-
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+# Build and distribution configuration
+[build-system]
+requires = [
+  "partis-pyproj[meson] ~= 0.1.1"]
+
+build-backend = "partis.pyproj.backend"
+
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+# Package meta-data
+[project]
+name = "partis-basis"
+description = ""
+readme = "README.rst"
+version = "0.0.1"
+license = { file = "LICENSE.rst" }
+
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+# Package dependencies
+requires-python = ">= 3.7.2"
+
+dependencies = [
+  "partis-pyproj ~= 0.1.1",
+  "partis-utils ~= 0.1.0",
+  "click >= 8.1.3",
+  "Jinja2 >= 3.1.2" ]
+
+[[project.authors]]
+name = "Nanohmics Inc"
+email = ""
+
+[project.scripts]
+basis = "partis.basis.__main__:main"
+
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+[tool.pyproj.dist]
+ignore = [
+  '**/__pycache__',
+  '**/*.py[cod]',
+  '*.egg-info',
+  '**/.git',
+  '**/.github',
+  '**/.gitignore',
+  '**/.gitmodules' ]
+
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+[tool.pyproj.dist.source]
+ignore = [
+  '**/*.so' ]
+
+copy = [
+  'src',
+  'LICENSE.rst',
+  'pyproject.toml',
+  'README.rst']
+
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+# binary distribution installed paths
+[[tool.pyproj.dist.binary.purelib.copy]]
+src = 'src/partis-basis'
+dst = 'partis/basis'
+glob = '**/*.py'

@@ -1,6 +1,7 @@
 from __future__ import annotations
 import anyio
 from anyio.streams.file import FileWriteStream, FileReadStream
+from anyio import Path as APath
 import sys
 import os
 from pathlib import Path
@@ -16,6 +17,12 @@ from tempfile import TemporaryDirectory
 from shlex import quote
 from subprocess import Popen
 import shutil
+import webbrowser
+# import asks
+import requests
+import errno
+from timeit import default_timer as timer
+import json
 
 venv = Path(os.environ['HOME'])/'.basis'
 
@@ -46,7 +53,7 @@ MPI_ENV_REC = re.compile('|'.join([
   '(PMIX_*\w+)',
   '(HYDRA_*\w+)']))
 
-CONTAINER = "library://kcdodd/basis/ubuntu-22.04-jupyter:basis"
+CONTAINER = "library://kcdodd/basis/ubuntu-22.04-basis:0.0.1"
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 def set_win_size(fd):
@@ -68,6 +75,66 @@ def find_basis(start):
     tmp = tmp.parent
 
   return None
+
+
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+async def check_code_server_and_open_browser(url, token_file):
+  await anyio.sleep(2)
+
+  while True:
+    if await token_file.exists():
+      token = await token_file.read_text().strip()
+      _url = f"{url}/?tkn={token}"
+
+      try:
+        response = requests.get(_url)
+        if response.status_code == 200:
+          webbrowser.open(_url)
+          break
+
+      except Exception as e:
+        print(f"GET {_url} -> {e}")
+        sys.stdout.flush()
+        import traceback
+        traceback.print_exc()
+        pass
+
+    await anyio.sleep(2)
+
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+async def check_jupyter_server_and_open_browser(url, token_dir):
+  await anyio.sleep(2)
+
+  while True:
+    if await token_dir.exists():
+      files = []
+
+      async for file in token_dir.glob('jpserver-*.json'):
+        files.append(file)
+
+      if not files:
+        continue
+
+      config = json.loads(await files[-1].read_text())
+
+      token = config.get('token', '')
+      port = config.get('port', '')
+      _url = f"{url}:{port}/lab?token={token}"
+
+      try:
+        response = requests.get(_url)
+        if response.status_code == 200:
+          webbrowser.open(_url)
+          break
+
+      except Exception as e:
+        print(f"GET {_url} -> {e}")
+        sys.stdout.flush()
+        import traceback
+        traceback.print_exc()
+        pass
+
+    await anyio.sleep(2)
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 async def run(image, app, basis, work, cwd, cmd):
@@ -103,12 +170,54 @@ async def run(image, app, basis, work, cwd, cmd):
 
   assert app in ['bash', 'fish', 'jupyter', 'code']
 
+  jupyter_dir = basis/'.local'/'share'/'jupyter'/'runtime'
+
+  if jupyter_dir.exists():
+    shutil.rmtree(str(jupyter_dir))
+
+  print("Entering container...")
+
   isatty = os.isatty(sys.stdin.fileno())
+  restore_io = True
+  host_fd = -1
+  pid = 0
+
+  stdin_fd = sys.stdin.fileno()
+  stdout_fd = sys.stdout.fileno()
+
+  stdin_fl = fcntl.fcntl(stdin_fd, fcntl.F_GETFL)
+
+  fcntl.fcntl(stdin_fd, fcntl.F_SETFL, stdin_fl | os.O_NONBLOCK)
 
   if isatty:
     old_winch_handler = signal.getsignal(signal.SIGWINCH)
     old_tty = termios.tcgetattr(sys.stdin)
-    tty.setraw(sys.stdin.fileno())
+    tty.setraw(stdin_fd)
+
+  def _restore_io():
+    nonlocal restore_io, host_fd, pid
+
+    if restore_io:
+      restore_io = False
+
+      if pid != 0:
+        os.kill(pid, signal.SIGKILL)
+        pid = 0
+
+      fcntl.fcntl(stdin_fd, fcntl.F_SETFL, stdin_fl)
+
+      try:
+        os.close(host_fd)
+      except:
+        pass
+
+      host_fd = -1
+
+      if isatty:
+        signal.signal(signal.SIGWINCH, old_winch_handler)
+        termios.tcsetattr(stdin_fd, termios.TCSAFLUSH, old_tty)
+
+      print("... Exited container")
 
   env = {
     k:v
@@ -143,43 +252,60 @@ async def run(image, app, basis, work, cwd, cmd):
         # should not return
         assert False
 
+      fcntl.fcntl(host_fd, fcntl.F_SETFL, fcntl.fcntl(host_fd, fcntl.F_GETFL)|os.O_NONBLOCK)
+
       if isatty:
         set_win_size(host_fd)
         signal.signal(signal.SIGWINCH, lambda signal, frame: set_win_size(host_fd))
 
       async def _fwd_io():
-        stdin_fd = sys.stdin.fileno()
-        stdout_fd = sys.stdout.fileno()
+        try:
+          ti = timer()
+          while True:
+            tf = timer()
+            await anyio.sleep(max(0, 0.025 - (tf-ti)))
+            ti = timer()
 
-        while True:
-          try:
-            r, w, e = select.select([stdin_fd, host_fd], [], [])
-
-            if stdin_fd in r:
+            try:
               os.write(host_fd, os.read(stdin_fd, 1024))
+            except OSError as e:
+              if e.errno not in [errno.EAGAIN, errno.EWOULDBLOCK]:
+                raise
+            except EOFError:
+              raise
 
-            elif host_fd in r:
+            try:
               os.write(stdout_fd, os.read(host_fd, 1024))
+            except OSError as e:
+              if e.errno not in [errno.EAGAIN, errno.EWOULDBLOCK]:
+                raise
+            except EOFError:
+              raise
 
-          except (OSError, EOFError):
-            break
-
-          await anyio.sleep(0)
+        finally:
+          _restore_io()
 
       async with anyio.create_task_group() as tg:
         tg.start_soon(_fwd_io)
 
-    finally:
-      try:
-        os.close(host_fd)
-      except:
+        if app == 'code':
+          token_file = APath(basis/'.openvscode-server'/'data'/'token')
+          tg.start_soon(
+            check_code_server_and_open_browser,
+            "http://localhost:3000",
+            token_file)
+
+        elif app == 'jupyter':
+          tg.start_soon(
+            check_jupyter_server_and_open_browser,
+            "http://localhost",
+            APath(jupyter_dir))
+
+    except OSError as e:
+      if e.errno == errno.EIO:
         pass
-
-      host_fd = -1
-
-      if isatty:
-        signal.signal(signal.SIGWINCH, old_winch_handler)
-        termios.tcsetattr(sys.stdin, termios.TCSAFLUSH, old_tty)
+    finally:
+      _restore_io()
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 @click.command(context_settings=dict(
@@ -210,9 +336,15 @@ async def run(image, app, basis, work, cwd, cmd):
   help = "",
   type = Path,
   default = Path.cwd())
-@click.argument('cmd', nargs = -1, type = click.UNPROCESSED)
+@click.argument(
+  'cmd',
+  nargs = -1,
+  type = click.UNPROCESSED)
 def main(image, app, basis, work, cwd, cmd):
-  anyio.run(run, image, app, basis, work, cwd, cmd)
+  anyio.run(
+    run, image, app, basis, work, cwd, cmd,
+    backend_options = dict(
+      use_uvloop = True))
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 exit(main())

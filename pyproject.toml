@@ -12,9 +12,9 @@ build-backend = "partis.pyproj.backend"
 [project]
 name = "partis-basis"
 description = ""
-readme = "README.rst"
+readme = "README.md"
 version = "0.0.1"
-license = { file = "LICENSE.rst" }
+license = { file = "LICENSE.txt" }
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 # Package dependencies
@@ -53,9 +53,9 @@ ignore = [
 
 copy = [
   'src',
-  'LICENSE.rst',
+  'LICENSE.txt',
   'pyproject.toml',
-  'README.rst']
+  'README.md']
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 # binary distribution installed paths

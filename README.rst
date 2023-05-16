@@ -1,1 +1,0 @@
-CLI utility for using Singularity container as virtual environment.

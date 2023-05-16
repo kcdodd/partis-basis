@@ -1,6 +1,5 @@
 from __future__ import annotations
 import anyio
-from anyio.streams.file import FileWriteStream, FileReadStream
 from anyio import Path as APath
 import sys
 import os
@@ -10,21 +9,19 @@ import fcntl
 import termios
 import tty
 import pty
-import select
 import signal
 import re
 from tempfile import TemporaryDirectory
 from shlex import quote
-from subprocess import Popen
 import shutil
 import webbrowser
-# import asks
-import requests
+import asks
 import errno
 from timeit import default_timer as timer
 import json
 
 venv = Path(os.environ['HOME'])/'.basis'
+APPS = ['bash', 'fish', 'jupyter', 'code']
 
 MPI_ENV_REC = re.compile('|'.join([
   # OpenMPI:
@@ -83,20 +80,20 @@ async def check_code_server_and_open_browser(url, token_file):
 
   while True:
     if await token_file.exists():
-      token = await token_file.read_text().strip()
+      token = (await token_file.read_text()).strip()
       _url = f"{url}/?tkn={token}"
+      print(_url)
 
       try:
-        response = requests.get(_url)
-        if response.status_code == 200:
-          webbrowser.open(_url)
-          break
+        response = await asks.get(_url)
+        webbrowser.open(_url)
+        break
 
       except Exception as e:
-        print(f"GET {_url} -> {e}")
-        sys.stdout.flush()
-        import traceback
-        traceback.print_exc()
+        # print(f"GET {_url} -> {e}")
+        # sys.stdout.flush()
+        # import traceback
+        # traceback.print_exc()
         pass
 
     await anyio.sleep(2)
@@ -122,16 +119,15 @@ async def check_jupyter_server_and_open_browser(url, token_dir):
       _url = f"{url}:{port}/lab?token={token}"
 
       try:
-        response = requests.get(_url)
-        if response.status_code == 200:
-          webbrowser.open(_url)
-          break
+        response = await asks.get(_url)
+        webbrowser.open(_url)
+        break
 
       except Exception as e:
-        print(f"GET {_url} -> {e}")
-        sys.stdout.flush()
-        import traceback
-        traceback.print_exc()
+        # print(f"GET {_url} -> {e}")
+        # sys.stdout.flush()
+        # import traceback
+        # traceback.print_exc()
         pass
 
     await anyio.sleep(2)
@@ -168,7 +164,7 @@ async def run(image, app, basis, work, cwd, cmd):
   else:
     pwd = cwd
 
-  assert app in ['bash', 'fish', 'jupyter', 'code']
+  assert app in APPS
 
   jupyter_dir = basis/'.local'/'share'/'jupyter'/'runtime'
 
@@ -318,7 +314,7 @@ async def run(image, app, basis, work, cwd, cmd):
   default = CONTAINER)
 @click.option(
   '-a', '--app',
-  help = "",
+  help = f"{{{', '.join(APPS)}}}",
   type = str,
   default = 'fish')
 @click.option(
@@ -330,7 +326,7 @@ async def run(image, app, basis, work, cwd, cmd):
   '-w', '--work',
   help = "",
   type = Path,
-  default = Path.cwd())
+  default = Path('/'))
 @click.option(
   '-c', '--cwd',
   help = "",

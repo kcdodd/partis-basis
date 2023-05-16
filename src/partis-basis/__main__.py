@@ -17,6 +17,7 @@ import shutil
 import webbrowser
 import asks
 import errno
+import shlex
 from timeit import default_timer as timer
 import json
 
@@ -50,7 +51,7 @@ MPI_ENV_REC = re.compile('|'.join([
   '(PMIX_*\w+)',
   '(HYDRA_*\w+)']))
 
-CONTAINER = "library://kcdodd/basis/ubuntu-22.04-basis:0.0.1"
+CONTAINER = "library://kcdodd/basis/ubuntu-22.04-basis:0.0.2"
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 def set_win_size(fd):
@@ -228,22 +229,24 @@ async def run(image, app, basis, work, cwd, cmd):
       f"{k}='{quote(str(v))}'"
       for k,v in env.items()]))
 
+    cmd_singularity = [
+      'singularity',
+      'run',
+      '--app',
+      app,
+      '--cleanenv',
+      '--no-home',
+      '--env-file', str(env_file),
+      '--pwd', str(pwd),
+      '--bind', f"{basis}:/basis",
+      '--bind', f"{work}:/work",
+      str(image),
+      *cmd]
+
     try:
       pid, host_fd = pty.fork()
       if pid == 0:
-        os.execvp('singularity', [
-          'singularity',
-          'run',
-          '--app',
-          app,
-          '--cleanenv',
-          '--no-home',
-          '--env-file', str(env_file),
-          '--pwd', str(pwd),
-          '--bind', f"{basis}:/basis",
-          '--bind', f"{work}:/work",
-          str(image),
-          *cmd])
+        os.execvp(cmd_singularity[0], cmd_singularity)
 
         # should not return
         assert False
@@ -315,7 +318,7 @@ async def run(image, app, basis, work, cwd, cmd):
 @click.option(
   '-a', '--app',
   help = f"{{{', '.join(APPS)}}}",
-  type = str,
+  type = click.Choice(APPS),
   default = 'fish')
 @click.option(
   '-b', '--basis',

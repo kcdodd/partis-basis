@@ -13,18 +13,14 @@ build-backend = "partis.pyproj.backend"
 name = "partis-basis"
 description = ""
 readme = "README.md"
-version = "0.0.2"
+version = "0.0.4"
 license = { file = "LICENSE.txt" }
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 # Package dependencies
 requires-python = ">= 3.7.2"
 
-dependencies = [
-  "click >= 8.1.3",
-  "anyio",
-  "asks >= 3.0.0",
-  "uvloop >= 0.17.0" ]
+dependencies = []
 
 [[project.authors]]
 name = "Nanohmics Inc"

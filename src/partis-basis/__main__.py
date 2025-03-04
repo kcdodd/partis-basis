@@ -7,12 +7,38 @@ import shutil
 import json
 import argparse
 import shlex
-from subprocess import check_output, check_call
+import warnings
+from subprocess import check_output, check_call, CalledProcessError
 
+#===============================================================================
 _PY = f"{'.'.join(str(v) for v in sys.version_info[:2])}"
+_CONFIG_DIR = Path.home()/'.config'/'partis-basis'
+_CONFIG_FILE = _CONFIG_DIR/'config.json'
+
+#===============================================================================
+# directory for Container Device Interface (CDI) configs
+_CDI_DIR = _CONFIG_DIR/'cdi'
+_CDI_DIRS = [_CDI_DIR, Path('/etc/cdi'), Path('/var/run/cdi')]
+
+if not _CDI_DIR.exists():
+  _CDI_DIR.mkdir(exist_ok=True, parents=True)
+
+#===============================================================================
+_CONFIG = {}
+_CONFIG_DEFAULTS = {
+  "default_image": "library://kcdodd/basis/ubuntu-22.04-basis:0.0.4"}
+
+if _CONFIG_FILE.exists():
+  _CONFIG = json.loads(_CONFIG_FILE.read_bytes())
+
+_CONFIG = _CONFIG_DEFAULTS|_CONFIG
+
+#===============================================================================
 APPS = ['bash', 'fish', 'manage']
 
 PASS_ENV = frozenset([
+  'PATH',
+  'LD_LIBRARY_PATH',
   'USER',
   'LOGNAME',
   'LANG',
@@ -41,33 +67,49 @@ PASS_ENV = frozenset([
 
 MPI_ENV_REC = re.compile('|'.join([
   # OpenMPI:
-  '(OMPI_*\w+)',
-  '(PMIX_*\w+)',
-  '(OPAL_*\w+)',
-  '(ORTE_*\w+)',
+  r'(OMPI_*\w+)',
+  r'(PMIX_*\w+)',
+  r'(OPAL_*\w+)',
+  r'(ORTE_*\w+)',
 
   # MPICH:
-  '(MPIR_*\w+)',
-  '(PMI_*\w+)',
-  '(PMIX_*\w+)',
-  '(HYDRA_*\w+)',
+  r'(MPIR_*\w+)',
+  r'(PMI_*\w+)',
+  r'(PMIX_*\w+)',
+  r'(HYDRA_*\w+)',
 
   # Intel MPI:
-  '(I_MPI_*\w+)',
-  '(MPIR_*\w+)',
-  '(PMI_*\w+)',
-  '(PMIX_*\w+)',
-  '(HYDRA_*\w+)',
+  r'(I_MPI_*\w+)',
+  r'(MPIR_*\w+)',
+  r'(PMI_*\w+)',
+  r'(PMIX_*\w+)',
+  r'(HYDRA_*\w+)',
 
   # MVAPICH2:
-  '(MV2_*\w+)',
-  '(MPIR_*\w+)',
-  '(PMI_*\w+)',
-  '(PMIX_*\w+)',
-  '(HYDRA_*\w+)']))
+  r'(MV2_*\w+)',
+  r'(MPIR_*\w+)',
+  r'(PMI_*\w+)',
+  r'(PMIX_*\w+)',
+  r'(HYDRA_*\w+)']))
 
-DEFAULT_IMAGE = "library://kcdodd/basis/ubuntu-22.04-basis:0.0.4"
+#===============================================================================
+_nvidia_ctk = shutil.which('nvidia-ctk')
 
+if _nvidia_ctk is not None:
+  name = 'nvidia.yaml'
+
+  # if nvidia container tooklkit is installed, check/generate CDI config
+  for dir in _CDI_DIRS:
+    if (dir/name).exists():
+      break
+
+  else:
+    _nvidia_cdi = _CDI_DIR/name
+
+    try:
+      check_call([_nvidia_ctk, 'cdi', 'generate', f'--output={_nvidia_cdi}'])
+    except Exception as e:
+      warnings.warn(f"Could not create nvidia Container Device Interface (CDI) config: {e}")
 
 #===============================================================================
 def _basis(*,
@@ -112,7 +154,7 @@ def _basis(*,
 
     if created:
       if image is None:
-        image = DEFAULT_IMAGE
+        image = _CONFIG.get('default_image')
 
       basis_config_file.write_text(json.dumps({
         'image': str(image)}))
@@ -169,20 +211,27 @@ def init(image, basis, cwd, python):
   return 0
 
 #===============================================================================
-def run(image, basis, app, work, cwd, cmd):
+def run(image, basis, app, work, cwd, cmd, device):
   singularity = shutil.which('singularity')
-  nvccli = shutil.which('nvidia-container-cli')
+  oci_mode = False
+
+  # nvccli = shutil.which('nvidia-container-cli')
 
   if not singularity:
     print("Error: Program 'singularity' not found")
     return 1
 
-  if nvccli:
-    runhelp = check_output([singularity, 'run', '--help']).decode('utf-8')
+  _owner = Path(singularity).owner()
 
-    if '--nvccli' not in runhelp:
-      print("Warning: singularity version must be >= 3.9 to utilize nvidia-container-toolkit found on host")
-      nvccli = None
+  if _owner != 'root' and _owner == os.getlogin():
+    oci_mode = True
+
+  # if nvccli:
+  #   runhelp = check_output([singularity, 'run', '--help']).decode('utf-8')
+
+  #   if '--nvccli' not in runhelp:
+  #     print("Warning: singularity version must be >= 3.9 to utilize nvidia-container-toolkit found on host")
+  #     nvccli = None
 
   work = work.resolve()
 
@@ -197,8 +246,21 @@ def run(image, basis, app, work, cwd, cmd):
 
   extra_args = []
 
-  if nvccli:
-    extra_args.extend(['--nv', '--nvccli'])
+  # if nvccli:
+  #   # generate
+  #   extra_args.extend(['--nv', '--nvccli', '--oci'])
+
+  if device:
+    # currently CDI device only supported in OCI mode
+    oci_mode = True
+    extra_args.extend([
+      '--device', device])
+
+  if oci_mode:
+    extra_args.extend([
+      '--oci',
+      '--no-compat',
+      '--cdi-dirs', ','.join(str(v) for v in _CDI_DIRS)])
 
   cmd_singularity = [
     singularity,
@@ -220,7 +282,7 @@ def run(image, basis, app, work, cwd, cmd):
   print(f" work: {work}")
   print(f"  cwd: {cwd}")
   print(f" exec: {shlex.join(cmd)}")
-  print("Entering container...")
+  print(f"Running: {shlex.join(cmd_singularity[1:])}")
 
   # flush stdout before replacing process
   sys.stdout.flush()
@@ -274,6 +336,11 @@ def main():
     default=_PY)
 
   parser.add_argument(
+    '--device',
+    type=str,
+    default=None)
+
+  parser.add_argument(
       '-w', '--work',
       help="",
       type=Path,
@@ -298,7 +365,7 @@ def main():
     image = args.image
 
     if image is None:
-      image = DEFAULT_IMAGE
+      image = _CONFIG.get('default_image')
 
     if init(
       image = image,
@@ -314,18 +381,8 @@ def main():
     app = args.app,
     work = args.work,
     cwd = args.cwd,
-    cmd = args.cmd)
-
-#===============================================================================
-def find_basis(start):
-  tmp = start
-  while tmp.name:
-    if (tmp/'.basis').exists():
-      return tmp/'.basis'
-
-    tmp = tmp.parent
-
-  return None
+    cmd = args.cmd,
+    device = args.device)
 
 #===============================================================================
 exit(main())

@@ -211,9 +211,8 @@ def init(image, basis, cwd, python):
   return 0
 
 #===============================================================================
-def run(image, basis, app, work, cwd, cmd, device):
+def run(image, basis, app, work, cwd, cmd, device, oci_mode):
   singularity = shutil.which('singularity')
-  oci_mode = False
 
   # nvccli = shutil.which('nvidia-container-cli')
 
@@ -221,10 +220,10 @@ def run(image, basis, app, work, cwd, cmd, device):
     print("Error: Program 'singularity' not found")
     return 1
 
-  _owner = Path(singularity).owner()
+  # _owner = Path(singularity).owner()
 
-  if _owner != 'root' and _owner == os.getlogin():
-    oci_mode = True
+  # if _owner != 'root' and _owner == os.getlogin():
+  #   oci_mode = True
 
   # if nvccli:
   #   runhelp = check_output([singularity, 'run', '--help']).decode('utf-8')
@@ -331,6 +330,12 @@ def main():
       help="Create and initialize basis directory if it doesn't exist")
 
   parser.add_argument(
+      '--oci',
+      dest='oci_mode',
+      action='store_true',
+      help="Run container in OCI mode")
+
+  parser.add_argument(
     '--python',
     type=str,
     default=_PY)
@@ -382,7 +387,8 @@ def main():
     work = args.work,
     cwd = args.cwd,
     cmd = args.cmd,
-    device = args.device)
+    device = args.device,
+    oci_mode = args.oci_mode)
 
 #===============================================================================
 exit(main())

@@ -170,8 +170,15 @@ def _basis(*,
   return image, basis, default
 
 #===============================================================================
-def init(image, basis, cwd, python):
+def init(image, basis, work, cwd, python):
   name = 'init'
+
+  work = work.resolve()
+
+  if cwd.is_absolute():
+    pwd = cwd
+  else:
+    pwd = Path('/')/'work'/cwd
 
   singularity = shutil.which('singularity')
 
@@ -186,7 +193,6 @@ def init(image, basis, cwd, python):
     print(f"Cannot initialize non-empty directory: {env_dir}")
     return 1
 
-  pwd = str(cwd)
   env = {
     k:v
     for k,v in os.environ.items()
@@ -200,6 +206,7 @@ def init(image, basis, cwd, python):
       '--no-home',
       '--pwd', str(pwd),
       '--bind', f"{basis}:/basis",
+      '--bind', f"{work}:/work",
       str(image),
       *cmd],
       env=env)
@@ -211,7 +218,7 @@ def init(image, basis, cwd, python):
   return 0
 
 #===============================================================================
-def run(image, basis, app, work, cwd, cmd, device, oci_mode):
+def run(image, basis, app, work, cwd, cmd, device, oci_mode, silent, network):
   singularity = shutil.which('singularity')
 
   # nvccli = shutil.which('nvidia-container-cli')
@@ -234,14 +241,17 @@ def run(image, basis, app, work, cwd, cmd, device, oci_mode):
 
   work = work.resolve()
 
+  if cwd.is_absolute():
+    pwd = cwd
+  else:
+    pwd = Path('/')/'work'/cwd
+
   image, basis, default = _basis(basis=basis, image=image)
 
   env = {
     k:v
     for k,v in os.environ.items()
     if k in PASS_ENV or MPI_ENV_REC.fullmatch(k)}
-
-  pwd = str(cwd)
 
   extra_args = []
 
@@ -261,6 +271,12 @@ def run(image, basis, app, work, cwd, cmd, device, oci_mode):
       '--no-compat',
       '--cdi-dirs', ','.join(str(v) for v in _CDI_DIRS)])
 
+
+  if network:
+    extra_args.extend([
+      '--net',
+      '--network', network])
+
   cmd_singularity = [
     singularity,
     'run',
@@ -271,21 +287,23 @@ def run(image, basis, app, work, cwd, cmd, device, oci_mode):
     '--pwd', str(pwd),
     '--bind', f"{basis}:/basis",
     '--bind', f"{work}:/work",
-    '--bind', f"{pwd}:{pwd}",
+    # '--bind', f"{pwd}:{pwd}",
     str(image),
     *cmd]
 
-  print(f"image: {image}")
-  print(f"  app: {app}")
-  print(f"basis: {basis}")
-  print(f" work: {work}")
-  print(f"  cwd: {cwd}")
-  print(f" exec: {shlex.join(cmd)}")
-  print(f"Running: {shlex.join(cmd_singularity[1:])}")
+  if not silent:
+    print(f"image: {image}")
+    print(f"  app: {app}")
+    print(f"basis: {basis}")
+    print(f" work: {work}")
+    print(f"  cwd: {cwd}")
+    print(f" exec: {shlex.join(cmd)}")
+    print(f"Running: {shlex.join(cmd_singularity[1:])}")
 
-  # flush stdout before replacing process
-  sys.stdout.flush()
-  sys.stderr.flush()
+    # flush stdout before replacing process
+    sys.stdout.flush()
+    sys.stderr.flush()
+
   os.execve(cmd_singularity[0], cmd_singularity, env)
 
 #===============================================================================
@@ -303,37 +321,49 @@ def _cuda_info(nvccli):
 def main():
 
   parser = argparse.ArgumentParser(
-      description="partis-basis runner for singularity container based environments")
+    description="partis-basis runner for singularity container based environments")
 
   parser.add_argument(
-      '-i', '--image',
-      help="",
-      type=str,
-      default=None)
+    '-i', '--image',
+    help="",
+    type=str,
+    default=None)
 
   parser.add_argument(
-      '-a', '--app',
-      help=f"{', '.join(APPS)}",
-      choices=APPS,
-      default='bash')
+    '-a', '--app',
+    help=f"{', '.join(APPS)}",
+    choices=APPS,
+    default='bash')
 
   parser.add_argument(
-      '-b', '--basis',
-      help="",
-      type=Path,
-      default=None)
+    '-b', '--basis',
+    help="",
+    type=Path,
+    default=None)
 
   parser.add_argument(
-      '--init',
-      dest='init',
-      action='store_true',
-      help="Create and initialize basis directory if it doesn't exist")
+    '--init',
+    dest='init',
+    action='store_true',
+    help="Create and initialize basis directory if it doesn't exist")
 
   parser.add_argument(
-      '--oci',
-      dest='oci_mode',
-      action='store_true',
-      help="Run container in OCI mode")
+    '--oci',
+    dest='oci_mode',
+    action='store_true',
+    help="Run container in OCI mode")
+
+  parser.add_argument(
+    '--silent',
+    dest='silent',
+    action='store_true',
+    help="Run without reporting container startup")
+
+  parser.add_argument(
+    '--network',
+    type=str,
+    default = '',
+    help="Run in a new network")
 
   parser.add_argument(
     '--python',
@@ -359,12 +389,23 @@ def main():
 
   # cmd (positional, collects all remaining)
   # Using REMAINDER so everything after this argument is captured "as-is."
-  parser.add_argument(
-    'cmd',
-    nargs='*',
-    help="Command and its arguments")
+  # parser.add_argument(
+  #   'cmd',
+  #   nargs='*',
+  #   help="Command and its arguments")
 
-  args = parser.parse_args()
+  # args = parser.parse_args()
+  args, extra = parser.parse_known_args()
+
+  command = None
+
+  if extra:
+    if extra[0] != '--':
+      parser.print_help()
+      return 1
+
+    command = extra[1:]
+
 
   if args.init:
     image = args.image
@@ -375,10 +416,14 @@ def main():
     if init(
       image = image,
       basis = args.basis,
+      work = args.work,
       cwd = args.cwd,
       python = args.python):
 
       return 1
+
+  if command is not None and not command:
+      return 0
 
   return run(
     image = args.image,
@@ -386,9 +431,11 @@ def main():
     app = args.app,
     work = args.work,
     cwd = args.cwd,
-    cmd = args.cmd,
+    cmd = command or [],
     device = args.device,
-    oci_mode = args.oci_mode)
+    oci_mode = args.oci_mode,
+    silent = args.silent,
+    network = args.network)
 
 #===============================================================================
 exit(main())

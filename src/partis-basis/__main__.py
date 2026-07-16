@@ -34,7 +34,7 @@ if _CONFIG_FILE.exists():
 _CONFIG = _CONFIG_DEFAULTS|_CONFIG
 
 #===============================================================================
-APPS = ['bash', 'fish', 'manage']
+APPS = ['bash', 'fish', 'claude', 'manage']
 
 PASS_ENV = frozenset([
   'PATH',
@@ -218,7 +218,7 @@ def init(image, basis, work, cwd, python):
   return 0
 
 #===============================================================================
-def run(image, basis, app, work, cwd, cmd, device, oci_mode, silent, network):
+def run(image, basis, app, work, cwd, cmd, device, oci_mode, silent, network, knowledge):
   singularity = shutil.which('singularity')
 
   # nvccli = shutil.which('nvidia-container-cli')
@@ -277,6 +277,42 @@ def run(image, basis, app, work, cwd, cmd, device, oci_mode, silent, network):
       '--net',
       '--network', network])
 
+  mounts = [
+    '--bind', f"{basis}:/basis",
+    '--bind', f"{work}:/work:ro"]
+
+  if knowledge:
+    mounts.extend([
+      '--bind', f"{knowledge}:/okf"])
+
+
+  # Claude Code stores OAuth creds at <config-dir>/.credentials.json and
+  # rewrites them atomically (temp file + rename) whenever the ~8h access
+  # token refreshes. A single-file bind mount can't survive that rename
+  # (rename onto a mount point -> EBUSY), and a token injected via
+  # CLAUDE_CODE_OAUTH_TOKEN is treated as inference-only and never refreshes
+  # -- both approaches go stale. Instead give the container its own
+  # persistent, writable, isolated config dir (so plugins install once with
+  # stable absolute paths) and bootstrap it from the host login just once.
+
+  if host_claude_config := os.environ.get('CLAUDE_CONFIG_DIR'):
+    host_claude_config = Path(host_claude_config)
+  else:
+    host_claude_config = Path.home()/".claude"
+
+  if host_claude_config.exists():
+    basis_claude_config = basis/".claude"
+    basis_claude_config.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    # one-time bootstrap; afterwards the container owns and refreshes its
+    # own token lineage independently of the host
+    # shutil.copyfile(host_creds, container_creds)
+    # container_creds.chmod(0o600)
+
+    mounts.extend(['--bind', f"{host_claude_config}:/basis/.claude"])
+    # env['CLAUDE_CONFIG_DIR'] = '/basis/.claude'
+
+
   cmd_singularity = [
     singularity,
     'run',
@@ -285,9 +321,7 @@ def run(image, basis, app, work, cwd, cmd, device, oci_mode, silent, network):
     *extra_args,
     '--no-home',
     '--pwd', str(pwd),
-    '--bind', f"{basis}:/basis",
-    '--bind', f"{work}:/work",
-    # '--bind', f"{pwd}:{pwd}",
+    *mounts,
     str(image),
     *cmd]
 
@@ -387,6 +421,12 @@ def main():
       type=Path,
       default=Path.cwd())
 
+  parser.add_argument(
+      '--knowledge',
+      help="",
+      type=Path,
+      default=None)
+
   # cmd (positional, collects all remaining)
   # Using REMAINDER so everything after this argument is captured "as-is."
   # parser.add_argument(
@@ -435,7 +475,8 @@ def main():
     device = args.device,
     oci_mode = args.oci_mode,
     silent = args.silent,
-    network = args.network)
+    network = args.network,
+    knowledge = args.knowledge)
 
 #===============================================================================
 exit(main())

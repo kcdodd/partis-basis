@@ -3,7 +3,7 @@
 # Build and distribution configuration
 [build-system]
 requires = [
-  "partis-pyproj[meson] ~= 0.1.1"]
+  "partis-pyproj[meson] ~= 0.2.2"]
 
 build-backend = "partis.pyproj.backend"
 
@@ -18,7 +18,7 @@ license = { file = "LICENSE.txt" }
 
 #+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 # Package dependencies
-requires-python = ">= 3.7.2"
+requires-python = ">= 3.10"
 
 dependencies = []
 

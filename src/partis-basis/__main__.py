@@ -366,7 +366,7 @@ def main():
   parser.add_argument(
     '-a', '--app',
     help=f"{', '.join(APPS)}",
-    choices=APPS,
+    # choices=APPS, # too restrictive, can run other containers with different apps (fail at run)
     default='bash')
 
   parser.add_argument(
@@ -410,22 +410,22 @@ def main():
     default=None)
 
   parser.add_argument(
-      '-w', '--work',
-      help="",
-      type=Path,
-      default=Path('/'))
+    '-w', '--work',
+    help="",
+    type=Path,
+    default=Path('/'))
 
   parser.add_argument(
-      '-c', '--cwd',
-      help="",
-      type=Path,
-      default=Path.cwd())
+    '-c', '--cwd',
+    help="",
+    type=Path,
+    default=Path.cwd())
 
   parser.add_argument(
-      '--knowledge',
-      help="",
-      type=Path,
-      default=None)
+    '--knowledge',
+    help="",
+    type=Path,
+    default=None)
 
   # cmd (positional, collects all remaining)
   # Using REMAINDER so everything after this argument is captured "as-is."

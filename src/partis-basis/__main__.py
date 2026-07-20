@@ -63,7 +63,9 @@ PASS_ENV = frozenset([
   'TF_CPP_MAX_VLOG_LEVEL',
   'TF_CPP_VMODULE',
   'PJRT_NPROC',
-  'XLA_FLAGS'])
+  'XLA_FLAGS',
+  # pass claude pre-auth for headless runs
+  'CLAUDE_CODE_OAUTH_TOKEN'])
 
 MPI_ENV_REC = re.compile('|'.join([
   # OpenMPI:
@@ -284,34 +286,6 @@ def run(image, basis, app, work, cwd, cmd, device, oci_mode, silent, network, kn
   if knowledge:
     mounts.extend([
       '--bind', f"{knowledge}:/okf"])
-
-
-  # Claude Code stores OAuth creds at <config-dir>/.credentials.json and
-  # rewrites them atomically (temp file + rename) whenever the ~8h access
-  # token refreshes. A single-file bind mount can't survive that rename
-  # (rename onto a mount point -> EBUSY), and a token injected via
-  # CLAUDE_CODE_OAUTH_TOKEN is treated as inference-only and never refreshes
-  # -- both approaches go stale. Instead give the container its own
-  # persistent, writable, isolated config dir (so plugins install once with
-  # stable absolute paths) and bootstrap it from the host login just once.
-
-  if host_claude_config := os.environ.get('CLAUDE_CONFIG_DIR'):
-    host_claude_config = Path(host_claude_config)
-  else:
-    host_claude_config = Path.home()/".claude"
-
-  if host_claude_config.exists():
-    basis_claude_config = basis/".claude"
-    basis_claude_config.mkdir(mode=0o700, parents=True, exist_ok=True)
-
-    # one-time bootstrap; afterwards the container owns and refreshes its
-    # own token lineage independently of the host
-    # shutil.copyfile(host_creds, container_creds)
-    # container_creds.chmod(0o600)
-
-    mounts.extend(['--bind', f"{host_claude_config}:/basis/.claude"])
-    # env['CLAUDE_CONFIG_DIR'] = '/basis/.claude'
-
 
   cmd_singularity = [
     singularity,

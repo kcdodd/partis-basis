@@ -26,7 +26,7 @@ if not _CDI_DIR.exists():
 #===============================================================================
 _CONFIG = {}
 _CONFIG_DEFAULTS = {
-  "default_image": "library://kcdodd/basis/ubuntu-22.04-basis:0.0.4"}
+  "default_image": "library://kcdodd/basis/ubuntu-22.04-basis:0.1.0"}
 
 if _CONFIG_FILE.exists():
   _CONFIG = json.loads(_CONFIG_FILE.read_bytes())

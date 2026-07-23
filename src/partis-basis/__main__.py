@@ -172,15 +172,9 @@ def _basis(*,
   return image, basis, default
 
 #===============================================================================
-def init(image, basis, work, cwd, python):
+def init(*, image, basis, cwd, python):
   name = 'init'
-
-  work = work.resolve()
-
-  if cwd.is_absolute():
-    pwd = cwd
-  else:
-    pwd = Path('/')/'work'/cwd
+  pwd = cwd.resolve()
 
   singularity = shutil.which('singularity')
 
@@ -208,7 +202,6 @@ def init(image, basis, work, cwd, python):
       '--no-home',
       '--pwd', str(pwd),
       '--bind', f"{basis}:/basis",
-      '--bind', f"{work}:/work",
       str(image),
       *cmd],
       env=env)
@@ -220,7 +213,19 @@ def init(image, basis, work, cwd, python):
   return 0
 
 #===============================================================================
-def run(image, basis, app, work, cwd, cmd, device, oci_mode, silent, network, knowledge):
+def run(*,
+    image,
+    basis,
+    app,
+    read,
+    work,
+    cwd,
+    cmd,
+    device,
+    oci_mode,
+    silent,
+    network,
+    knowledge):
   singularity = shutil.which('singularity')
 
   # nvccli = shutil.which('nvidia-container-cli')
@@ -241,12 +246,7 @@ def run(image, basis, app, work, cwd, cmd, device, oci_mode, silent, network, kn
   #     print("Warning: singularity version must be >= 3.9 to utilize nvidia-container-toolkit found on host")
   #     nvccli = None
 
-  work = work.resolve()
-
-  if cwd.is_absolute():
-    pwd = cwd
-  else:
-    pwd = Path('/')/'work'/cwd
+  pwd = cwd.resolve()
 
   image, basis, default = _basis(basis=basis, image=image)
 
@@ -280,12 +280,25 @@ def run(image, basis, app, work, cwd, cmd, device, oci_mode, silent, network, kn
       '--network', network])
 
   mounts = [
-    '--bind', f"{basis}:/basis",
-    '--bind', f"{work}:/work:ro"]
+    # '--bind', f"{basis}:/basis"
+    '--mount', f'type=bind,"src={basis}",dst=/basis']
+
+  for path in read:
+    path = str(path.resolve())
+    mounts.extend([
+      # '--bind', f"{path}:ro"
+      '--mount', f'type=bind,"src={path}","dst={path}",ro'])
+
+  for path in work:
+    path = str(path.resolve())
+    mounts.extend([
+      #'--bind', str(path)
+      '--mount', f'type=bind,"src={path}","dst={path}"'])
 
   if knowledge:
     mounts.extend([
-      '--bind', f"{knowledge}:/okf"])
+      # '--bind', f"{knowledge}:/okf"
+      '--mount', f'type=bind,"src={knowledge}",dst=/okf'])
 
   cmd_singularity = [
     singularity,
@@ -384,10 +397,18 @@ def main():
     default=None)
 
   parser.add_argument(
-    '-w', '--work',
-    help="",
+    '-r', '--read',
+    help="Add a read-only directory to mounts",
     type=Path,
-    default=Path('/'))
+    action='append',
+    default=[])
+
+  parser.add_argument(
+    '-w', '--work',
+    help="Add a writable directory to mounts",
+    type=Path,
+    action='append',
+    default=[])
 
   parser.add_argument(
     '-c', '--cwd',
@@ -430,7 +451,6 @@ def main():
     if init(
       image = image,
       basis = args.basis,
-      work = args.work,
       cwd = args.cwd,
       python = args.python):
 
@@ -443,6 +463,7 @@ def main():
     image = args.image,
     basis = args.basis,
     app = args.app,
+    read = args.read,
     work = args.work,
     cwd = args.cwd,
     cmd = command or [],

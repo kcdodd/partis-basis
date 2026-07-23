@@ -38,15 +38,15 @@ Loading environment: /basis/envs/default
 Welcome to fish, the friendly interactive shell
 Type help for instructions on how to use fish
 >? ok | 10:43:13 | 0ms
->[S] user@hostname | (default) | /work/path/to/cwd
+>[S] user@hostname | (default) | /path/to/cwd
 >$ echo $HOME
 /basis
 >? ok | 10:55:36 | 0ms
->[S] user@hostname | (default) | /work/path/to/cwd
+>[S] user@hostname | (default) | /path/to/cwd
 >$ which python
 /basis/envs/default/bin/python
 >? ok | 10:59:06 | 6ms
->[S] user@hostname | (default) | /work/path/to/cwd
+>[S] user@hostname | (default) | /path/to/cwd
 >$ exit
 ... Exited container
 ```

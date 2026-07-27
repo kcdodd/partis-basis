@@ -219,6 +219,7 @@ def run(*,
     app,
     read,
     work,
+    host_read,
     cwd,
     cmd,
     device,
@@ -301,6 +302,10 @@ def run(*,
       # '--bind', f"{knowledge}:/okf"
       '--mount', f'type=bind,"src={knowledge}",dst=/okf'])
 
+  if host_read:
+    mounts.extend([
+      '--mount', 'type=bind,src=/,dst=/host,ro'])
+
   cmd_singularity = [
     singularity,
     'run',
@@ -317,9 +322,19 @@ def run(*,
     print(f"image: {image}")
     print(f"  app: {app}")
     print(f"basis: {basis}")
-    print(f" work: {work}")
-    print(f"  cwd: {cwd}")
-    print(f" exec: {shlex.join(cmd)}")
+
+    if host_read:
+      print(" host: (read-only) '/' -> '/host'")
+
+    if read:
+      print(f" read: {', '.join([repr(str(path)) for path in read])}")
+
+    print(f" work: {', '.join([repr(str(path)) for path in work])}")
+    print(f"  cwd: {repr(str(cwd))}")
+
+    if cmd:
+      print(f" exec: {shlex.join(cmd)}")
+
     print(f"Running: {shlex.join(cmd_singularity[1:])}")
 
     # flush stdout before replacing process
@@ -374,6 +389,12 @@ def main():
     dest='oci_mode',
     action='store_true',
     help="Run container in OCI mode")
+
+  parser.add_argument(
+    '--host_read',
+    dest='host_read',
+    action='store_true',
+    help="Add a read-only mount of host system at /host")
 
   parser.add_argument(
     '--silent',
@@ -466,6 +487,7 @@ def main():
     app = args.app,
     read = args.read,
     work = args.work,
+    host_read = args.host_read,
     cwd = args.cwd,
     cmd = command or [],
     device = args.device,

@@ -298,9 +298,11 @@ def run(*,
       '--mount', f'type=bind,"src={path}","dst={path}"'])
 
   if knowledge:
+    env['OKF_ROOT'] = '/okf'
+
     mounts.extend([
       # '--bind', f"{knowledge}:/okf"
-      '--mount', f'type=bind,"src={knowledge}",dst=/okf'])
+      '--mount', f'type=bind,"src={knowledge.resolve()}",dst=/okf'])
 
   if host_read:
     mounts.extend([

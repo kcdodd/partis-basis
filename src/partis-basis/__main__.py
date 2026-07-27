@@ -247,6 +247,7 @@ def run(*,
   #     nvccli = None
 
   pwd = cwd.resolve()
+  work += [pwd]
 
   image, basis, default = _basis(basis=basis, image=image)
 

@@ -9,6 +9,7 @@ import ctypes
 import tempfile
 import argparse
 import shlex
+import pwd
 from subprocess import check_output, check_call, CalledProcessError, STDOUT
 
 #===============================================================================
@@ -19,10 +20,23 @@ _CONFIG_FILE = _CONFIG_DIR/'config.json'
 #===============================================================================
 # directory for Container Device Interface (CDI) configs
 _CDI_DIR = _CONFIG_DIR/'cdi'
-# NOTE: '/etc/cdi' and '/var/run/cdi' are managed by the host (root), only specs
-# in _CDI_DIR are generated/updated here
-_CDI_DIRS = [_CDI_DIR, Path('/etc/cdi'), Path('/var/run/cdi')]
+# NOTE: the CDI default search directories, managed by the host (root). Only
+# specs in _CDI_DIR are generated/updated here.
+_CDI_DIR_HOST = [Path('/etc/cdi'), Path('/var/run/cdi')]
+# extensions the runtime recognizes as a spec
+_CDI_SUFFIX = ('.yaml', '.json')
 _CDI_NVIDIA = 'nvidia.yaml'
+_CDI_NVIDIA_KIND = 'nvidia.com/gpu'
+
+# 'kind: nvidia.com/gpu', anchored so a nested value cannot match
+_CDI_KIND_REC = re.compile(
+  r'^\s*"?kind"?\s*:\s*"?(?P<kind>[\w.\-]+/[\w.\-]+)"?',
+  re.MULTILINE)
+
+# device names ('  name: "0"'); the deeper 'hookName' keys cannot match
+_CDI_NAME_REC = re.compile(
+  r'^\s*-?\s*"?name"?\s*:\s*"?(?P<name>[\w.\-:]+)"?',
+  re.MULTILINE)
 
 #===============================================================================
 _CONFIG = {}
@@ -32,7 +46,13 @@ _CONFIG_DEFAULTS = {
   "nvidia_cdi": "auto"}
 
 if _CONFIG_FILE.exists():
-  _CONFIG = json.loads(_CONFIG_FILE.read_bytes())
+  try:
+    _CONFIG = json.loads(_CONFIG_FILE.read_bytes())
+
+  except (OSError, ValueError) as e:
+    print(
+      f"Warning: Ignoring unreadable config {_CONFIG_FILE}: {e}",
+      file=sys.stderr)
 
 _CONFIG = _CONFIG_DEFAULTS|_CONFIG
 
@@ -67,6 +87,9 @@ PASS_ENV = frozenset([
   'TF_CPP_VMODULE',
   'PJRT_NPROC',
   'XLA_FLAGS',
+  # NOTE: a scheduler sets this for a gpu allocation (e.g. slurm GRES), so it is
+  # inherited when '--gpu' does not select devices itself
+  'CUDA_VISIBLE_DEVICES',
   # pass claude pre-auth for headless runs
   'CLAUDE_CODE_OAUTH_TOKEN'])
 
@@ -102,10 +125,93 @@ def _debug() -> bool:
   return bool(os.environ.get('BASIS_DEBUG'))
 
 #===============================================================================
+def _err(*lines: str):
+  """Report to stderr, so error text does not land in piped output"""
+  for line in lines:
+    print(line, file=sys.stderr)
+
+#===============================================================================
 def _tail(output: bytes|None, n: int = 5) -> list[str]:
   lines = (output or b'').decode('utf-8', errors='replace').splitlines()
 
   return [line for line in lines if line.strip()][-n:]
+
+#===============================================================================
+def _csv(values: list[str]) -> list[str]:
+  """Flatten repeated and comma separated option values, preserving order"""
+  names = []
+
+  for value in values:
+    for name in value.split(','):
+      name = name.strip()
+
+      if name and name not in names:
+        names.append(name)
+
+  return names
+
+#===============================================================================
+def _gpu_names(values: list[str]) -> list[str]:
+  """Normalize a '--gpu' selection to CDI device names"""
+  names = _csv(values)
+
+  if 'all' in names:
+    # 'all' subsumes any other selection, and injecting one device twice is a
+    # CDI conflict rather than a duplicate
+    return ['all']
+
+  return names
+
+#===============================================================================
+def _subid(path: Path = Path('/etc/subuid')) -> bool:
+  """Whether a subordinate uid range exists for the current user
+
+  OCI mode maps ids through this range; the file is often present but empty.
+  """
+  uid = os.getuid()
+  names = {str(uid)}
+
+  try:
+    names.add(pwd.getpwuid(uid).pw_name)
+  except KeyError:
+    pass
+
+  try:
+    return any(
+      line.split(':')[0] in names
+      for line in path.read_text().splitlines())
+
+  except OSError:
+    return False
+
+#===============================================================================
+def _oci_deps():
+  """Report OCI mode dependencies that are missing
+
+  Advisory only: singularity is the authority on what its OCI mode requires, but
+  the failure it reports for a missing one does not name it.
+  """
+  missing = []
+
+  if not (shutil.which('crun') or shutil.which('runc')):
+    missing.append("'crun' or 'runc' (OCI runtime)")
+
+  for name, why in [
+      ('conmon', 'container monitor'),
+      ('fuse-overlayfs', 'writable overlay'),
+      ('newuidmap', 'user namespace id mapping')]:
+
+    if not shutil.which(name):
+      missing.append(f"{name!r} ({why})")
+
+  if os.getuid() != 0 and not _subid():
+    missing.append("a '/etc/subuid' range for the current user")
+
+  if missing:
+    _err("Warning: OCI mode dependencies not found:")
+
+    for line in missing:
+      _err(f"  {line}")
 
 #===============================================================================
 def _nvidia_driver() -> str|None:
@@ -115,7 +221,7 @@ def _nvidia_driver() -> str|None:
   is exactly what 'nvidia-ctk' needs to enumerate devices.
   """
   try:
-    ctypes.CDLL('libnvidia-ml.so.1')
+    nvml = ctypes.CDLL('libnvidia-ml.so.1')
   except OSError:
     return None
 
@@ -125,110 +231,276 @@ def _nvidia_driver() -> str|None:
 
   version = Path('/sys/module/nvidia/version')
 
-  # NOTE: not present on WSL2, where the spec is not pinned to a host driver
-  return version.read_text().strip() if version.exists() else 'unknown'
+  try:
+    if version.is_file():
+      return version.read_text().strip() or 'unknown'
+
+  except OSError:
+    pass
+
+  # '/sys/module/nvidia' is absent on WSL2. NVML reports the same version there,
+  # but costs an 'nvmlInit', so it is only the fallback.
+  return _nvidia_driver_nvml(nvml) or 'unknown'
 
 #===============================================================================
-def _nvidia_cdi(device: str, *, refresh: bool = False) -> int:
-  """Ensure a Container Device Interface (CDI) spec exists for an nvidia device
+def _nvidia_driver_nvml(nvml: ctypes.CDLL) -> str|None:
+  buf = ctypes.create_string_buffer(80)
 
-  Returns non-zero if the requested device cannot be made available.
+  try:
+    if nvml.nvmlInit_v2() != 0:
+      return None
+
+    try:
+      if nvml.nvmlSystemGetDriverVersion(buf, len(buf)) != 0:
+        return None
+
+    finally:
+      nvml.nvmlShutdown()
+
+  except (AttributeError, OSError):
+    return None
+
+  return buf.value.decode('utf-8', errors='replace').strip() or None
+
+#===============================================================================
+def _cdi_spec(spec: Path) -> tuple[str|None, list[str]]:
+  """The device kind a CDI spec declares, and the device names it declares
+
+  Parsed only well enough to tell specs apart and to check that a requested
+  device exists. Returns (None, []) for anything not understood: the runtime
+  remains the authority, this only gives a better error before reaching it.
+  """
+  try:
+    text = spec.read_text(errors='replace')
+
+  except OSError:
+    return None, []
+
+  if spec.suffix == '.json':
+    try:
+      data = json.loads(text)
+
+      return (
+        data.get('kind'),
+        [
+          name
+          for device in (data.get('devices') or [])
+          if isinstance(name := device.get('name'), str)])
+
+    except (ValueError, AttributeError):
+      return None, []
+
+  kind = _CDI_KIND_REC.search(text)
+
+  # NOTE: 'devices' precedes 'kind' in a generated spec, so the whole file has
+  # to be read either way
+  return (
+    kind.group('kind') if kind else None,
+    _CDI_NAME_REC.findall(text))
+
+#===============================================================================
+def _cdi_host_spec(kind: str) -> Path|None:
+  """Host managed spec declaring 'kind', if there is one
+
+  Detected by content rather than filename: host tooling chooses the filename,
+  and a host spec missed here means a second spec declaring the same devices,
+  which the runtime resolves as a conflict.
+  """
+  for _dir in _CDI_DIR_HOST:
+    try:
+      specs = sorted(p for p in _dir.iterdir() if p.suffix in _CDI_SUFFIX)
+
+    except OSError:
+      continue
+
+    for spec in specs:
+      if _cdi_spec(spec)[0] == kind:
+        return spec
+
+  return None
+
+#===============================================================================
+def _cdi_dirs() -> list[Path]:
+  """CDI search directories that exist, most specific first
+
+  A search directory that does not exist is not skipped by singularity, and only
+  _CDI_DIR can be created here. '/var/run' is a symlink to '/run' on most hosts,
+  so resolve before de-duplicating: one spec reached by two paths declares its
+  devices twice.
+  """
+  dirs = []
+
+  for _dir in [_CDI_DIR, *_CDI_DIR_HOST]:
+    try:
+      if not _dir.is_dir():
+        continue
+
+      _dir = _dir.resolve()
+
+    except OSError:
+      continue
+
+    if _dir not in dirs:
+      dirs.append(_dir)
+
+  return dirs
+
+#===============================================================================
+def _nvidia_cdi(names: list[str], *, refresh: bool = False) -> int:
+  """Ensure a CDI spec declaring the requested nvidia gpu devices is available
+
+  Returns non-zero if a requested device cannot be made available.
   """
   if _CONFIG.get('nvidia_cdi') == 'off':
-    # host is assumed to manage CDI specs
+    # host is assumed to manage CDI specs entirely
+    if refresh or _debug():
+      print(
+        f"Not generating CDI config for {_CDI_NVIDIA_KIND}:"
+        f" 'nvidia_cdi' is 'off' in {_CONFIG_FILE}")
+
     return 0
+
+  cdi = _CDI_DIR/_CDI_NVIDIA
+  # a generated spec references version suffixed driver libraries, so it has to
+  # be re-generated after a host driver upgrade
+  stamp = _CDI_DIR/f'{_CDI_NVIDIA}.driver'
+  host = _cdi_host_spec(_CDI_NVIDIA_KIND)
+
+  if host is not None:
+    # The host managed spec wins, but _CDI_DIR is searched first: a generated
+    # spec left in place would declare the same devices as the host one.
+    try:
+      cdi.unlink(missing_ok=True)
+      stamp.unlink(missing_ok=True)
+
+    except OSError as e:
+      _err(f"Error: Could not remove generated CDI config: {e}")
+      return 1
+
+    if refresh:
+      print(f"Host managed CDI config, not re-generated: {host}")
+
+    return _nvidia_cdi_check(host, names)
 
   driver = _nvidia_driver()
 
   if driver is None:
-    print(
-      f"Error: --device {device!r} requires an nvidia driver"
+    _err(
+      f"Error: {_CDI_NVIDIA_KIND} devices require an nvidia driver"
       " ('libnvidia-ml.so.1' not found)")
     return 1
 
   nvidia_ctk = shutil.which('nvidia-ctk')
 
   if nvidia_ctk is None:
-    print(
-      f"Error: --device {device!r} requires 'nvidia-ctk'"
-      " (nvidia-container-toolkit)")
+    _err(
+      f"Error: {_CDI_NVIDIA_KIND} devices require 'nvidia-ctk'"
+      " (nvidia-container-toolkit), or a host managed CDI config in"
+      f" {', '.join(str(v) for v in _CDI_DIR_HOST)}")
     return 1
 
-  cdi = _CDI_DIR/_CDI_NVIDIA
-  # generated spec references version suffixed driver libraries, so it must be
-  # re-generated after a host driver upgrade
-  stamp = _CDI_DIR/f'{_CDI_NVIDIA}.driver'
-  stale = not (
-    cdi.exists()
-    and stamp.exists()
-    and stamp.read_text().strip() == driver)
+  try:
+    stale = not (
+      cdi.is_file()
+      and stamp.is_file()
+      and stamp.read_text().strip() == driver)
 
-  for _dir in _CDI_DIRS[1:]:
-    if (_dir/_CDI_NVIDIA).exists():
-      # prefer the host managed spec, but do not let a stale one shadow it
-      if stale and cdi.exists():
-        cdi.unlink()
+  except OSError as e:
+    _err(f"Error: Could not read CDI driver stamp {stamp}: {e}")
+    return 1
 
-      return 0
+  if (stale or refresh) and _nvidia_cdi_generate(nvidia_ctk, driver, cdi, stamp):
+    return 1
 
-  if not (stale or refresh):
-    return 0
+  return _nvidia_cdi_check(cdi, names)
 
-  _CDI_DIR.mkdir(exist_ok=True, parents=True)
-
-  # Generate out of place so a failed run cannot leave a truncated spec, but not
-  # within _CDI_DIR itself, since anything there is a spec as far as the runtime
-  # is concerned.
-  # NOTE: nvidia-ctk infers the spec format from the output file extension,
-  # appending '.yaml' if it is not recognized.
-  fd, _tmp = tempfile.mkstemp(
-    dir=_CDI_DIR.parent,
-    prefix=f'.{_CDI_NVIDIA}.',
-    suffix='.yaml')
-
-  os.close(fd)
-  tmp = Path(_tmp)
-
-  cmd = [nvidia_ctk, 'cdi', 'generate', f'--output={tmp}']
+#===============================================================================
+def _nvidia_cdi_generate(
+    nvidia_ctk: str,
+    driver: str,
+    cdi: Path,
+    stamp: Path) -> int:
+  """Generate the nvidia CDI spec in _CDI_DIR"""
+  cmd = [nvidia_ctk, 'cdi', 'generate', '--format=yaml']
+  tmp = None
 
   try:
+    _CDI_DIR.mkdir(exist_ok=True, parents=True)
+
+    # Generate out of place so a failed run cannot leave a truncated spec, but
+    # not within _CDI_DIR itself, since anything there with a spec extension is
+    # a spec as far as the runtime is concerned.
+    fd, _tmp = tempfile.mkstemp(
+      dir=_CDI_DIR.parent,
+      prefix=f'.{_CDI_NVIDIA}.',
+      suffix='.yaml')
+
+    os.close(fd)
+    tmp = Path(_tmp)
+    cmd.append(f'--output={tmp}')
+
     # nvidia-ctk is chatty on stderr even when it succeeds
     output = check_output(cmd, stderr=STDOUT)
 
-  except (CalledProcessError, OSError) as e:
-    tmp.unlink(missing_ok=True)
+    if not tmp.stat().st_size:
+      raise OSError(f"nothing written to {tmp}")
 
-    print(
+    os.replace(tmp, cdi)
+    # installed: no longer a temporary to clean up
+    tmp = None
+
+    stamp.write_text(driver)
+
+  except (CalledProcessError, OSError) as e:
+    _err(
       "Error: Could not create nvidia Container Device Interface (CDI)"
       f" config: {e}")
 
     for line in _tail(getattr(e, 'output', None)):
-      print(f"  {line}")
+      _err(f"  {line}")
 
-    print(f"  command: {shlex.join(cmd)}")
+    _err(f"  command: {shlex.join(cmd)}")
     return 1
 
-  if not (tmp.is_file() and tmp.stat().st_size):
-    tmp.unlink(missing_ok=True)
+  finally:
+    if tmp is not None:
+      # NOTE: nvidia-ctk appends '.yaml' to the output path if the extension is
+      # not one it recognizes, which would otherwise leak a spec sized file
+      for path in [tmp, Path(f'{tmp}.yaml')]:
+        try:
+          path.unlink(missing_ok=True)
 
-    print(
-      "Error: nvidia Container Device Interface (CDI) config not generated:"
-      f" {tmp}")
-
-    for line in _tail(output):
-      print(f"  {line}")
-
-    print(f"  command: {shlex.join(cmd)}")
-    return 1
-
-  os.replace(tmp, cdi)
-  stamp.write_text(driver)
+        except OSError:
+          pass
 
   if _debug():
     print(f"Generated CDI config for nvidia driver {driver}: {cdi}")
 
     for line in _tail(output, 100):
       print(f"  {line}")
+
+  return 0
+
+#===============================================================================
+def _nvidia_cdi_check(spec: Path, names: list[str]) -> int:
+  """Verify a CDI spec declares each requested device"""
+  available = _cdi_spec(spec)[1]
+
+  if not available:
+    # nothing parsed: leave the runtime as the authority rather than guess
+    if _debug():
+      print(f"No device names parsed from CDI config: {spec}")
+
+    return 0
+
+  missing = [name for name in names if name not in available]
+
+  if missing:
+    _err(
+      f"Error: CDI config declares no {_CDI_NVIDIA_KIND} device"
+      f" {', '.join(repr(v) for v in missing)}: {spec}",
+      f"  available: {', '.join(available)}")
+    return 1
 
   return 0
 
@@ -293,19 +565,20 @@ def _basis(*,
 #===============================================================================
 def init(*, image, basis, cwd, python):
   name = 'init'
-  pwd = cwd.resolve()
+  # NOTE: not 'pwd', which is a stdlib module used here
+  cwd_ = cwd.resolve()
 
   singularity = shutil.which('singularity')
 
   if not singularity:
-    print("Error: Program 'singularity' not found")
+    _err("Error: Program 'singularity' not found")
     return 1
 
   image, basis, default = _basis(basis=basis, image=image)
   env_dir = basis/'envs'/name
 
   if env_dir.is_dir() and any(env_dir.iterdir()):
-    print(f"Cannot initialize non-empty directory: {env_dir}")
+    _err(f"Cannot initialize non-empty directory: {env_dir}")
     return 1
 
   env = {
@@ -319,7 +592,7 @@ def init(*, image, basis, cwd, python):
       'run',
       '--app', 'manage',
       '--no-home',
-      '--pwd', str(pwd),
+      '--pwd', str(cwd_),
       '--bind', f"{basis}:/basis",
       str(image),
       *cmd],
@@ -341,6 +614,7 @@ def run(*,
     host_read,
     cwd,
     cmd,
+    gpu,
     device,
     oci_mode,
     refresh_cdi,
@@ -349,26 +623,12 @@ def run(*,
     knowledge):
   singularity = shutil.which('singularity')
 
-  # nvccli = shutil.which('nvidia-container-cli')
-
   if not singularity:
-    print("Error: Program 'singularity' not found")
+    _err("Error: Program 'singularity' not found")
     return 1
 
-  # _owner = Path(singularity).owner()
-
-  # if _owner != 'root' and _owner == os.getlogin():
-  #   oci_mode = True
-
-  # if nvccli:
-  #   runhelp = check_output([singularity, 'run', '--help']).decode('utf-8')
-
-  #   if '--nvccli' not in runhelp:
-  #     print("Warning: singularity version must be >= 3.9 to utilize nvidia-container-toolkit found on host")
-  #     nvccli = None
-
-  pwd = cwd.resolve()
-  work += [pwd]
+  cwd_ = cwd.resolve()
+  work += [cwd_]
 
   image, basis, default = _basis(basis=basis, image=image)
 
@@ -379,29 +639,77 @@ def run(*,
 
   extra_args = []
 
-  # if nvccli:
-  #   # generate
-  #   extra_args.extend(['--nv', '--nvccli', '--oci'])
+  # normalized here as well as in main(): injecting one device twice is a CDI
+  # conflict, so this must not depend on the caller having done it
+  gpu = _gpu_names(gpu)
+  device = _csv(device)
 
-  if device:
-    # currently CDI device only supported in OCI mode
-    oci_mode = True
+  # CDI devices are only supported in OCI mode, so an explicit '--device'
+  # requires it. Note this is decided before '--gpu' is resolved, which chooses
+  # its mechanism from the result.
+  oci_mode = oci_mode or bool(device)
 
-    if device.startswith('nvidia.com/') and _nvidia_cdi(device, refresh=refresh_cdi):
-      return 1
+  if gpu:
+    if oci_mode:
+      names = gpu
 
-    extra_args.extend([
-      '--device', device])
+      if names == ['all']:
+        # A scheduler allocated subset still applies (e.g. slurm sets
+        # 'CUDA_VISIBLE_DEVICES' for a GRES allocation). CDI device names are
+        # host indices/uuids, so the selection maps across directly.
+        names = _gpu_names([os.environ.get('CUDA_VISIBLE_DEVICES', '')]) or names
+
+      # CDI injects exactly the requested devices rather than filtering, so a
+      # host index means nothing inside the container
+      env.pop('CUDA_VISIBLE_DEVICES', None)
+
+      # de-duplicated against '--device': the same device named by both routes is
+      # still one device
+      device = _csv(device + [f'{_CDI_NVIDIA_KIND}={name}' for name in names])
+
+    else:
+      if _nvidia_driver() is None:
+        _err(
+          "Error: --gpu requires an nvidia driver"
+          " ('libnvidia-ml.so.1' not found)")
+        return 1
+
+      extra_args.append('--nv')
+
+      if refresh_cdi:
+        _err("Warning: --refresh-cdi has no effect outside OCI mode, which is"
+          " the only mode using CDI")
+
+      if gpu != ['all']:
+        # '--nv' binds every host gpu into the container, so this is what
+        # actually restricts the selection
+        env['CUDA_VISIBLE_DEVICES'] = ','.join(gpu)
+
+  nvidia = [
+    name.partition('=')[2]
+    for name in device
+    if name.startswith(f'{_CDI_NVIDIA_KIND}=')]
+
+  if nvidia and _nvidia_cdi(nvidia, refresh=refresh_cdi):
+    return 1
+
+  for name in device:
+    extra_args.extend(['--device', name])
 
   if oci_mode:
-    # singularity requires each search directory to exist
-    _CDI_DIR.mkdir(exist_ok=True, parents=True)
+    _oci_deps()
 
     extra_args.extend([
       '--oci',
-      '--no-compat',
-      '--cdi-dirs', ','.join(str(v) for v in _CDI_DIRS)])
+      '--no-compat'])
 
+    # NOTE: only the directories that exist, and only if any do; passing none
+    # leaves singularity with its own defaults
+    cdi_dirs = _cdi_dirs()
+
+    if cdi_dirs:
+      extra_args.extend([
+        '--cdi-dirs', ','.join(str(v) for v in cdi_dirs)])
 
   if network:
     extra_args.extend([
@@ -442,7 +750,7 @@ def run(*,
     app,
     *extra_args,
     '--no-home',
-    '--pwd', str(pwd),
+    '--pwd', str(cwd_),
     *mounts,
     str(image),
     *cmd]
@@ -461,6 +769,9 @@ def run(*,
     print(f" work: {', '.join([repr(str(path)) for path in work])}")
     print(f"  cwd: {repr(str(cwd))}")
 
+    if gpu:
+      print(f"  gpu: {', '.join(gpu)} ({'cdi' if oci_mode else '--nv'})")
+
     if cmd:
       print(f" exec: {shlex.join(cmd)}")
 
@@ -471,17 +782,6 @@ def run(*,
     sys.stderr.flush()
 
   os.execve(cmd_singularity[0], cmd_singularity, env)
-
-#===============================================================================
-def _cuda_info(nvccli):
-  info = check_output([nvccli, 'info', '--csv']).decode('utf-8')
-  lines = info.splitlines()
-  nvrm_version, cuda_version = lines[1].split(',')
-
-  nvrm_version = tuple(int(v) for v in nvrm_version.split('.'))
-  cuda_version = tuple(int(v) for v in cuda_version.split('.'))
-
-  return nvrm_version, cuda_version
 
 #===============================================================================
 def main():
@@ -523,7 +823,8 @@ def main():
     '--refresh-cdi',
     dest='refresh_cdi',
     action='store_true',
-    help="Re-generate the Container Device Interface (CDI) config for --device")
+    help="Re-generate the Container Device Interface (CDI) config for nvidia"
+      " gpus. Without --gpu or --device, re-generates and exits")
 
   parser.add_argument(
     '--host_read',
@@ -549,9 +850,24 @@ def main():
     default=_PY)
 
   parser.add_argument(
+    '--gpu',
+    metavar='DEVICES',
+    nargs='?',
+    const='all',
+    action='append',
+    default=[],
+    help="Make nvidia gpus available: 'all' (the default), or a comma separated"
+      " selection of host indices/uuids. In OCI mode the selection is injected"
+      " as CDI devices, otherwise '--nv' is used and the selection is applied"
+      " with 'CUDA_VISIBLE_DEVICES'. May be repeated")
+
+  parser.add_argument(
     '--device',
-    type=str,
-    default=None)
+    metavar='CDI_DEVICE',
+    action='append',
+    default=[],
+    help="Add a fully qualified CDI device (e.g. 'nvidia.com/gpu=0'), implying"
+      " --oci. May be repeated or comma separated")
 
   parser.add_argument(
     '-r', '--read',
@@ -598,6 +914,12 @@ def main():
 
     command = extra[1:]
 
+  gpu = _gpu_names(args.gpu)
+  device = _csv(args.device)
+
+  if args.refresh_cdi and not (gpu or device):
+    # nothing requested to run: re-generate the config and report
+    return _nvidia_cdi([], refresh=True)
 
   if args.init:
     image = args.image
@@ -625,7 +947,8 @@ def main():
     host_read = args.host_read,
     cwd = args.cwd,
     cmd = command or [],
-    device = args.device,
+    gpu = gpu,
+    device = device,
     oci_mode = args.oci_mode,
     refresh_cdi = args.refresh_cdi,
     silent = args.silent,

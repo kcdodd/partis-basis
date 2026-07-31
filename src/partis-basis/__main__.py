@@ -5,10 +5,11 @@ from pathlib import Path
 import re
 import shutil
 import json
+import ctypes
+import tempfile
 import argparse
 import shlex
-import warnings
-from subprocess import check_output, check_call, CalledProcessError
+from subprocess import check_output, check_call, CalledProcessError, STDOUT
 
 #===============================================================================
 _PY = f"{'.'.join(str(v) for v in sys.version_info[:2])}"
@@ -18,15 +19,17 @@ _CONFIG_FILE = _CONFIG_DIR/'config.json'
 #===============================================================================
 # directory for Container Device Interface (CDI) configs
 _CDI_DIR = _CONFIG_DIR/'cdi'
+# NOTE: '/etc/cdi' and '/var/run/cdi' are managed by the host (root), only specs
+# in _CDI_DIR are generated/updated here
 _CDI_DIRS = [_CDI_DIR, Path('/etc/cdi'), Path('/var/run/cdi')]
-
-if not _CDI_DIR.exists():
-  _CDI_DIR.mkdir(exist_ok=True, parents=True)
+_CDI_NVIDIA = 'nvidia.yaml'
 
 #===============================================================================
 _CONFIG = {}
 _CONFIG_DEFAULTS = {
-  "default_image": "library://kcdodd/basis/ubuntu-22.04-basis:0.1.0"}
+  "default_image": "library://kcdodd/basis/ubuntu-22.04-basis:0.2.0",
+  # 'auto' -> generate nvidia CDI spec on demand, 'off' -> never generate
+  "nvidia_cdi": "auto"}
 
 if _CONFIG_FILE.exists():
   _CONFIG = json.loads(_CONFIG_FILE.read_bytes())
@@ -95,23 +98,139 @@ MPI_ENV_REC = re.compile('|'.join([
   r'(HYDRA_*\w+)']))
 
 #===============================================================================
-_nvidia_ctk = shutil.which('nvidia-ctk')
+def _debug() -> bool:
+  return bool(os.environ.get('BASIS_DEBUG'))
 
-if _nvidia_ctk is not None:
-  name = 'nvidia.yaml'
+#===============================================================================
+def _tail(output: bytes|None, n: int = 5) -> list[str]:
+  lines = (output or b'').decode('utf-8', errors='replace').splitlines()
 
-  # if nvidia container tooklkit is installed, check/generate CDI config
-  for dir in _CDI_DIRS:
-    if (dir/name).exists():
-      break
+  return [line for line in lines if line.strip()][-n:]
 
-  else:
-    _nvidia_cdi = _CDI_DIR/name
+#===============================================================================
+def _nvidia_driver() -> str|None:
+  """Version of the host nvidia kernel driver, or None if no driver is present
 
-    try:
-      check_call([_nvidia_ctk, 'cdi', 'generate', f'--output={_nvidia_cdi}'])
-    except Exception as e:
-      warnings.warn(f"Could not create nvidia Container Device Interface (CDI) config: {e}")
+  Tests for the driver itself, not the container toolkit. 'libnvidia-ml.so.1'
+  is exactly what 'nvidia-ctk' needs to enumerate devices.
+  """
+  try:
+    ctypes.CDLL('libnvidia-ml.so.1')
+  except OSError:
+    return None
+
+  # native device nodes, or WSL2 (driver libraries under '/usr/lib/wsl/lib')
+  if not (Path('/dev/nvidiactl').exists() or Path('/dev/dxg').exists()):
+    return None
+
+  version = Path('/sys/module/nvidia/version')
+
+  # NOTE: not present on WSL2, where the spec is not pinned to a host driver
+  return version.read_text().strip() if version.exists() else 'unknown'
+
+#===============================================================================
+def _nvidia_cdi(device: str, *, refresh: bool = False) -> int:
+  """Ensure a Container Device Interface (CDI) spec exists for an nvidia device
+
+  Returns non-zero if the requested device cannot be made available.
+  """
+  if _CONFIG.get('nvidia_cdi') == 'off':
+    # host is assumed to manage CDI specs
+    return 0
+
+  driver = _nvidia_driver()
+
+  if driver is None:
+    print(
+      f"Error: --device {device!r} requires an nvidia driver"
+      " ('libnvidia-ml.so.1' not found)")
+    return 1
+
+  nvidia_ctk = shutil.which('nvidia-ctk')
+
+  if nvidia_ctk is None:
+    print(
+      f"Error: --device {device!r} requires 'nvidia-ctk'"
+      " (nvidia-container-toolkit)")
+    return 1
+
+  cdi = _CDI_DIR/_CDI_NVIDIA
+  # generated spec references version suffixed driver libraries, so it must be
+  # re-generated after a host driver upgrade
+  stamp = _CDI_DIR/f'{_CDI_NVIDIA}.driver'
+  stale = not (
+    cdi.exists()
+    and stamp.exists()
+    and stamp.read_text().strip() == driver)
+
+  for _dir in _CDI_DIRS[1:]:
+    if (_dir/_CDI_NVIDIA).exists():
+      # prefer the host managed spec, but do not let a stale one shadow it
+      if stale and cdi.exists():
+        cdi.unlink()
+
+      return 0
+
+  if not (stale or refresh):
+    return 0
+
+  _CDI_DIR.mkdir(exist_ok=True, parents=True)
+
+  # Generate out of place so a failed run cannot leave a truncated spec, but not
+  # within _CDI_DIR itself, since anything there is a spec as far as the runtime
+  # is concerned.
+  # NOTE: nvidia-ctk infers the spec format from the output file extension,
+  # appending '.yaml' if it is not recognized.
+  fd, _tmp = tempfile.mkstemp(
+    dir=_CDI_DIR.parent,
+    prefix=f'.{_CDI_NVIDIA}.',
+    suffix='.yaml')
+
+  os.close(fd)
+  tmp = Path(_tmp)
+
+  cmd = [nvidia_ctk, 'cdi', 'generate', f'--output={tmp}']
+
+  try:
+    # nvidia-ctk is chatty on stderr even when it succeeds
+    output = check_output(cmd, stderr=STDOUT)
+
+  except (CalledProcessError, OSError) as e:
+    tmp.unlink(missing_ok=True)
+
+    print(
+      "Error: Could not create nvidia Container Device Interface (CDI)"
+      f" config: {e}")
+
+    for line in _tail(getattr(e, 'output', None)):
+      print(f"  {line}")
+
+    print(f"  command: {shlex.join(cmd)}")
+    return 1
+
+  if not (tmp.is_file() and tmp.stat().st_size):
+    tmp.unlink(missing_ok=True)
+
+    print(
+      "Error: nvidia Container Device Interface (CDI) config not generated:"
+      f" {tmp}")
+
+    for line in _tail(output):
+      print(f"  {line}")
+
+    print(f"  command: {shlex.join(cmd)}")
+    return 1
+
+  os.replace(tmp, cdi)
+  stamp.write_text(driver)
+
+  if _debug():
+    print(f"Generated CDI config for nvidia driver {driver}: {cdi}")
+
+    for line in _tail(output, 100):
+      print(f"  {line}")
+
+  return 0
 
 #===============================================================================
 def _basis(*,
@@ -224,6 +343,7 @@ def run(*,
     cmd,
     device,
     oci_mode,
+    refresh_cdi,
     silent,
     network,
     knowledge):
@@ -266,10 +386,17 @@ def run(*,
   if device:
     # currently CDI device only supported in OCI mode
     oci_mode = True
+
+    if device.startswith('nvidia.com/') and _nvidia_cdi(device, refresh=refresh_cdi):
+      return 1
+
     extra_args.extend([
       '--device', device])
 
   if oci_mode:
+    # singularity requires each search directory to exist
+    _CDI_DIR.mkdir(exist_ok=True, parents=True)
+
     extra_args.extend([
       '--oci',
       '--no-compat',
@@ -393,6 +520,12 @@ def main():
     help="Run container in OCI mode")
 
   parser.add_argument(
+    '--refresh-cdi',
+    dest='refresh_cdi',
+    action='store_true',
+    help="Re-generate the Container Device Interface (CDI) config for --device")
+
+  parser.add_argument(
     '--host_read',
     dest='host_read',
     action='store_true',
@@ -494,6 +627,7 @@ def main():
     cmd = command or [],
     device = args.device,
     oci_mode = args.oci_mode,
+    refresh_cdi = args.refresh_cdi,
     silent = args.silent,
     network = args.network,
     knowledge = args.knowledge)

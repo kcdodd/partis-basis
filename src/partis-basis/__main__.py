@@ -39,9 +39,15 @@ _CDI_NAME_REC = re.compile(
   re.MULTILINE)
 
 #===============================================================================
+# The image this version runs, unless '--image' names another one. Not
+# configurable and not recorded in the basis directory: an environment runs
+# whichever image the installed partis-basis names, so install an older
+# partis-basis to go back to an older image.
+_IMAGE = "library://kcdodd/basis/ubuntu-22.04-basis:0.3.0"
+
+#===============================================================================
 _CONFIG = {}
 _CONFIG_DEFAULTS = {
-  "default_image": "library://kcdodd/basis/ubuntu-22.04-basis:0.3.0",
   # 'auto' -> generate nvidia CDI spec on demand, 'off' -> never generate
   "nvidia_cdi": "auto"}
 
@@ -505,18 +511,8 @@ def _nvidia_cdi_check(spec: Path, names: list[str]) -> int:
   return 0
 
 #===============================================================================
-def _basis(*,
-    image: str|None = None,
-    no_upgrade: bool = False,
-    basis: Path|None = None,
-    create: bool = True) -> tuple[str, str|None, Path, Path]:
-  """Resolve the image to run, and the basis directory to bind into it
-
-  The image is an explicit 'image', else the image the basis directory was
-  created with when 'no_upgrade', else the configured default. An existing basis
-  directory is *not* pinned to the image that created it, so a new default image
-  reaches environments that already exist.
-  """
+def _basis(*, basis: Path|None = None) -> tuple[Path, Path]:
+  """The basis directory to bind into the container, created if it is not there"""
 
   if basis is None:
     venv: str|Path = os.environ.get('VIRTUAL_ENV', '')
@@ -530,54 +526,14 @@ def _basis(*,
     basis = venv/'.basis'
 
   default = basis/'mods'/'environment'/'.version'
-  created = False
 
-  if create and not basis.exists():
+  if not basis.exists():
     basis.mkdir(parents=True)
-    created = True
 
-  basis_config_file = basis/'.config'/'basis'
-  # image the basis directory was created with, recorded so '--no-upgrade' has
-  # something to select
-  created_image = None
-
-  if basis_config_file.exists():
-    try:
-      created_image = json.loads(basis_config_file.read_text())['image']
-
-    except (OSError, ValueError, KeyError, TypeError) as e:
-      _err(f"Warning: Ignoring unreadable config {basis_config_file}: {e}")
-
-  else:
-    basis_config_file.parent.mkdir(exist_ok=True, parents=True)
-
-    if created:
-      created_image = image or _CONFIG.get('default_image')
-
-    else:
-      # fixup environment created without config file
-      # NOTE: hardcoded assumption that all older versions created with this image
-      created_image = "library://kcdodd/basis/ubuntu-22.04-basis:0.0.2"
-
-    basis_config_file.write_text(json.dumps({
-      'image': str(created_image)}))
-
-  if image is None:
-    if no_upgrade and created_image is None:
-      _err(
-        "Warning: --no-upgrade: no image recorded for the basis directory,"
-        f" using the configured default: {basis_config_file}")
-
-    image = (
-      created_image if no_upgrade and created_image is not None
-      else _CONFIG.get('default_image'))
-
-  assert isinstance(image, str)
-
-  return image, created_image, basis, default
+  return basis, default
 
 #===============================================================================
-def init(*, image, no_upgrade, basis, cwd, python):
+def init(*, image, basis, cwd, python):
   name = 'init'
   # NOTE: not 'pwd', which is a stdlib module used here
   cwd_ = cwd.resolve()
@@ -588,11 +544,7 @@ def init(*, image, no_upgrade, basis, cwd, python):
     _err("Error: Program 'singularity' not found")
     return 1
 
-  image, _, basis, default = _basis(
-    basis=basis,
-    image=image,
-    no_upgrade=no_upgrade)
-
+  basis, default = _basis(basis=basis)
   env_dir = basis/'envs'/name
 
   if env_dir.is_dir() and any(env_dir.iterdir()):
@@ -625,7 +577,6 @@ def init(*, image, no_upgrade, basis, cwd, python):
 #===============================================================================
 def run(*,
     image,
-    no_upgrade,
     basis,
     app,
     read,
@@ -649,10 +600,7 @@ def run(*,
   cwd_ = cwd.resolve()
   work += [cwd_]
 
-  image, created_image, basis, default = _basis(
-    basis=basis,
-    image=image,
-    no_upgrade=no_upgrade)
+  basis, default = _basis(basis=basis)
 
   env = {
     k:v
@@ -779,10 +727,6 @@ def run(*,
 
   if not silent:
     print(f"image: {image}")
-
-    if created_image is not None and created_image != image:
-      print(f"created: {created_image}")
-
     print(f"  app: {app}")
     print(f"basis: {basis}")
 
@@ -817,16 +761,9 @@ def main():
 
   parser.add_argument(
     '-i', '--image',
-    help="Container image to run. Default: the configured 'default_image'",
+    help="Container image to run (default: %(default)s)",
     type=str,
-    default=None)
-
-  parser.add_argument(
-    '--no-upgrade',
-    dest='no_upgrade',
-    action='store_true',
-    help="Do not use the configured default image; use the image recorded when"
-      " the basis directory was created")
+    default=_IMAGE)
 
   parser.add_argument(
     '-a', '--app',
@@ -954,14 +891,9 @@ def main():
     # nothing requested to run: re-generate the config and report
     return _nvidia_cdi([], refresh=True)
 
-  if args.image is not None and args.no_upgrade:
-    _err("Error: --image and --no-upgrade both select an image")
-    return 1
-
   if args.init:
     if init(
       image = args.image,
-      no_upgrade = args.no_upgrade,
       basis = args.basis,
       cwd = args.cwd,
       python = args.python):
@@ -973,7 +905,6 @@ def main():
 
   return run(
     image = args.image,
-    no_upgrade = args.no_upgrade,
     basis = args.basis,
     app = args.app,
     read = args.read,

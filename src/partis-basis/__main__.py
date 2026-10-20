@@ -590,12 +590,21 @@ def run(*,
     refresh_cdi,
     silent,
     network,
-    knowledge):
+    knowledge,
+    claude_md):
   singularity = shutil.which('singularity')
 
   if not singularity:
     _err("Error: Program 'singularity' not found")
     return 1
+
+  if claude_md:
+    claude_md = claude_md.resolve()
+
+    # binding over an existing file in the image requires a file source
+    if not claude_md.is_file():
+      _err(f"Error: --claude-md is not a file: {claude_md}")
+      return 1
 
   cwd_ = cwd.resolve()
   work += [cwd_]
@@ -709,6 +718,13 @@ def run(*,
       # '--bind', f"{knowledge}:/okf"
       '--mount', f'type=bind,"src={knowledge.resolve()}",dst=/okf'])
 
+  if claude_md:
+    # replaces only the managed CLAUDE.md, not managed-settings.json
+    mounts.extend([
+      # '--bind', f"{claude_md}:/etc/claude-code/CLAUDE.md:ro"
+      '--mount',
+      f'type=bind,"src={claude_md}",dst=/etc/claude-code/CLAUDE.md,ro'])
+
   if host_read:
     mounts.extend([
       '--mount', 'type=bind,src=/,dst=/host,ro'])
@@ -737,6 +753,9 @@ def run(*,
       print(f" read: {', '.join([repr(str(path)) for path in read])}")
 
     print(f" work: {', '.join([repr(str(path)) for path in work])}")
+
+    if claude_md:
+      print(f"claude: {repr(str(claude_md))} -> '/etc/claude-code/CLAUDE.md'")
     print(f"  cwd: {repr(str(cwd))}")
 
     if gpu:
@@ -865,6 +884,15 @@ def main():
     type=Path,
     default=None)
 
+  parser.add_argument(
+    '--claude-md',
+    dest='claude_md',
+    metavar='FILE',
+    help="Mount a host file (read-only) over the image's"
+      " /etc/claude-code/CLAUDE.md. managed-settings.json is not affected",
+    type=Path,
+    default=None)
+
   # cmd (positional, collects all remaining)
   # Using REMAINDER so everything after this argument is captured "as-is."
   # parser.add_argument(
@@ -918,7 +946,8 @@ def main():
     refresh_cdi = args.refresh_cdi,
     silent = args.silent,
     network = args.network,
-    knowledge = args.knowledge)
+    knowledge = args.knowledge,
+    claude_md = args.claude_md)
 
 #===============================================================================
 exit(main())

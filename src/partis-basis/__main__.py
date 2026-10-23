@@ -43,7 +43,16 @@ _CDI_NAME_REC = re.compile(
 # configurable and not recorded in the basis directory: an environment runs
 # whichever image the installed partis-basis names, so install an older
 # partis-basis to go back to an older image.
-_IMAGE = "library://kcdodd/basis/ubuntu-22.04-basis:0.3.0"
+_IMAGE = "oras://ghcr.io/kcdodd/partis-basis/ubuntu-22.04-basis:0.3.0"
+
+#===============================================================================
+_APPTAINER_INSTALL = "https://apptainer.org/docs/admin/main/installation.html"
+# first apptainer release with native CDI devices ('--device', '--cdi-dirs')
+_APPTAINER_CDI = (1, 5)
+
+# 'apptainer version 1.5.5', 'singularity-ce version 4.6.0'
+_VERSION_REC = re.compile(
+  r'^(?P<name>apptainer|singularity)\S*\s+version\s+(?P<major>\d+)\.(?P<minor>\d+)')
 
 #===============================================================================
 _CONFIG = {}
@@ -511,6 +520,47 @@ def _nvidia_cdi_check(spec: Path, names: list[str]) -> int:
   return 0
 
 #===============================================================================
+def _runtime() -> tuple[str, str, tuple[int, int]]|None:
+  """The container runtime: apptainer, or singularity as a deprecated fallback
+
+  Returns (executable, name, (major, minor)), or None if neither is usable.
+  Identified by its version output rather than the program name, since
+  apptainer installs a 'singularity' link to itself.
+  """
+  for prog in ['apptainer', 'singularity']:
+    exe = shutil.which(prog)
+
+    if not exe:
+      continue
+
+    try:
+      output = check_output([exe, '--version'], stderr=STDOUT)
+    except (CalledProcessError, OSError):
+      continue
+
+    m = _VERSION_REC.match(output.decode('utf-8', errors='replace').strip())
+
+    if not m:
+      _err(f"Warning: Unrecognized version from {exe}: {_tail(output, 1)}")
+      continue
+
+    name = m.group('name')
+
+    if name == 'singularity':
+      _err(
+        "Warning: Using singularity, which is deprecated for partis-basis and"
+        " will not be supported in a future release. Install apptainer:",
+        f"  {_APPTAINER_INSTALL}")
+
+    return exe, name, (int(m.group('major')), int(m.group('minor')))
+
+  _err(
+    "Error: Program 'apptainer' not found. Install apptainer:",
+    f"  {_APPTAINER_INSTALL}")
+
+  return None
+
+#===============================================================================
 def _basis(*, basis: Path|None = None) -> tuple[Path, Path]:
   """The basis directory to bind into the container, created if it is not there"""
 
@@ -538,11 +588,12 @@ def init(*, image, basis, cwd, python):
   # NOTE: not 'pwd', which is a stdlib module used here
   cwd_ = cwd.resolve()
 
-  singularity = shutil.which('singularity')
+  runtime = _runtime()
 
-  if not singularity:
-    _err("Error: Program 'singularity' not found")
+  if runtime is None:
     return 1
+
+  exe = runtime[0]
 
   basis, default = _basis(basis=basis)
   env_dir = basis/'envs'/name
@@ -558,7 +609,7 @@ def init(*, image, basis, cwd, python):
 
   def _run(*cmd):
     check_call([
-      singularity,
+      exe,
       'run',
       '--app', 'manage',
       '--no-home',
@@ -592,10 +643,23 @@ def run(*,
     network,
     knowledge,
     claude_md):
-  singularity = shutil.which('singularity')
+  runtime = _runtime()
 
-  if not singularity:
-    _err("Error: Program 'singularity' not found")
+  if runtime is None:
+    return 1
+
+  exe, runtime_name, runtime_version = runtime
+  apptainer = runtime_name == 'apptainer'
+
+  if oci_mode and apptainer:
+    _err("Error: --oci requires singularity; apptainer has no OCI mode")
+    return 1
+
+  if device and apptainer and runtime_version < _APPTAINER_CDI:
+    _err(
+      "Error: --device requires apptainer"
+      f" {'.'.join(str(v) for v in _APPTAINER_CDI)} or later (found"
+      f" {'.'.join(str(v) for v in runtime_version)})")
     return 1
 
   if claude_md:
@@ -623,10 +687,10 @@ def run(*,
   gpu = _gpu_names(gpu)
   device = _csv(device)
 
-  # CDI devices are only supported in OCI mode, so an explicit '--device'
-  # requires it. Note this is decided before '--gpu' is resolved, which chooses
-  # its mechanism from the result.
-  oci_mode = oci_mode or bool(device)
+  # singularity supports CDI devices only in OCI mode, so an explicit '--device'
+  # requires it there; apptainer supports them natively. Note this is decided
+  # before '--gpu' is resolved, which chooses its mechanism from the result.
+  oci_mode = oci_mode or (bool(device) and not apptainer)
 
   if gpu:
     if oci_mode:
@@ -682,8 +746,9 @@ def run(*,
       '--oci',
       '--no-compat'])
 
+  if oci_mode or device:
     # NOTE: only the directories that exist, and only if any do; passing none
-    # leaves singularity with its own defaults
+    # leaves the runtime with its own defaults
     cdi_dirs = _cdi_dirs()
 
     if cdi_dirs:
@@ -729,8 +794,8 @@ def run(*,
     mounts.extend([
       '--mount', 'type=bind,src=/,dst=/host,ro'])
 
-  cmd_singularity = [
-    singularity,
+  cmd_runtime = [
+    exe,
     'run',
     '--app',
     app,
@@ -764,19 +829,20 @@ def run(*,
     if cmd:
       print(f" exec: {shlex.join(cmd)}")
 
-    print(f"Running: {shlex.join(cmd_singularity[1:])}")
+    print(f"Running: {runtime_name} {shlex.join(cmd_runtime[1:])}")
 
     # flush stdout before replacing process
     sys.stdout.flush()
     sys.stderr.flush()
 
-  os.execve(cmd_singularity[0], cmd_singularity, env)
+  os.execve(cmd_runtime[0], cmd_runtime, env)
 
 #===============================================================================
 def main():
 
   parser = argparse.ArgumentParser(
-    description="partis-basis runner for singularity container based environments")
+    description="partis-basis runner for apptainer container based environments"
+      " (singularity is a deprecated fallback)")
 
   parser.add_argument(
     '-i', '--image',
@@ -806,7 +872,7 @@ def main():
     '--oci',
     dest='oci_mode',
     action='store_true',
-    help="Run container in OCI mode")
+    help="Run container in OCI mode (singularity only)")
 
   parser.add_argument(
     '--refresh-cdi',
@@ -855,8 +921,9 @@ def main():
     metavar='CDI_DEVICE',
     action='append',
     default=[],
-    help="Add a fully qualified CDI device (e.g. 'nvidia.com/gpu=0'), implying"
-      " --oci. May be repeated or comma separated")
+    help="Add a fully qualified CDI device (e.g. 'nvidia.com/gpu=0'). Requires"
+      " apptainer >= 1.5, or implies --oci with singularity. May be repeated or"
+      " comma separated")
 
   parser.add_argument(
     '-r', '--read',

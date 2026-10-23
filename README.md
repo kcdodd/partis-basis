@@ -1,4 +1,6 @@
-CLI utility for using Singularity container as virtual environment (requires singularity to already be installed).
+CLI utility for using an Apptainer container as virtual environment (requires
+[apptainer](https://apptainer.org/docs/admin/main/installation.html) to already
+be installed; singularity is used as a deprecated fallback).
 
 ```
 $ basis --help
@@ -13,7 +15,7 @@ Options:
   --help            Show this message and exit.
 ```
 
-The first time it is run it will download a pre-build Singularity image.
+The first time it is run it will download a pre-built container image.
 You must also tell it where to create the basis directory on the first run, which
 will become a virtual home inside the container.
 
